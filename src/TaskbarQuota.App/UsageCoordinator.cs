@@ -25,6 +25,10 @@ namespace TaskbarQuota
         private readonly SemaphoreSlim _detectGate = new(1, 1);
         private readonly object _recentLock = new();
         private readonly List<ProviderId> _recentProviders = new();
+        // Providers with a pinned-tile refresh currently in flight, so the 5s health timer never stacks a
+        // second fetch for one that's still running (a slow/offline endpoint would otherwise accumulate
+        // concurrent requests and could apply an older snapshot out of order).
+        private readonly HashSet<ProviderId> _widgetRefreshInFlight = new();
         private Timer? _timer;
         // Synara persists provider switches through a 300 ms-debounced localStorage writer, and Chromium
         // then flushes that to its on-disk LevelDB on its own (variable, sometimes >1 s) cadence. The
@@ -88,6 +92,52 @@ namespace TaskbarQuota
                         return p;
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Every provider the taskbar widget should show as its own tile: the pinned providers (always,
+        /// when visible + available) plus the active provider when it isn't already pinned. Pins let a
+        /// CLI user keep providers on the taskbar that active-app detection can't see (issue: terminal /
+        /// WMux tools). Returns the same single provider as <see cref="WidgetDisplayProvider"/> when
+        /// nothing is pinned, so the no-pins experience is unchanged.
+        /// </summary>
+        public IReadOnlyList<ProviderId> WidgetDisplayProviders
+            => ComputeWidgetDisplayProviders(
+                _lastActive,
+                IsActiveToolPresent,
+                Enum.GetValues<ProviderId>(),
+                WidgetSettingsService.IsProviderPinned,
+                WidgetSettingsService.IsProviderVisible,
+                IsProviderAvailable,
+                WidgetDisplayProvider);
+
+        // Pure, testable core of WidgetDisplayProviders. Order: a non-pinned active provider first (it
+        // comes and goes with app focus, so keeping it at the front leaves the pinned tiles in stable
+        // positions), then the pinned providers in enum order. A pinned provider that is also active is
+        // shown once, in its pinned position. Falls back to the single display provider only when nothing
+        // else qualifies and a tool is present — preserving today's behavior for users with no pins.
+        internal static IReadOnlyList<ProviderId> ComputeWidgetDisplayProviders(
+            ProviderId? active,
+            bool present,
+            IReadOnlyList<ProviderId> ordered,
+            Func<ProviderId, bool> isPinned,
+            Func<ProviderId, bool> isVisible,
+            Func<ProviderId, bool> isAvailable,
+            ProviderId? fallback)
+        {
+            var result = new List<ProviderId>();
+
+            if (present && active is { } a && isVisible(a) && !isPinned(a))
+                result.Add(a);
+
+            foreach (var p in ordered)
+                if (isPinned(p) && isVisible(p) && isAvailable(p) && !result.Contains(p))
+                    result.Add(p);
+
+            if (result.Count == 0 && present && fallback is { } fb)
+                result.Add(fb);
+
+            return result;
         }
 
         // A provider can back the widget only if it is actually installed or has been configured — so we
@@ -596,6 +646,36 @@ namespace TaskbarQuota
 
             LastState = snapshot;
             StateChanged?.Invoke(snapshot);
+        }
+
+        /// <summary>
+        /// Refresh a single provider's usage for a pinned taskbar tile and publish it via
+        /// <see cref="StateChanged"/> so the widget's routing applies it to that tile. Cheap: the fetch is
+        /// cache-TTL gated, so most calls return the cached snapshot. Does not touch <see cref="LastState"/>
+        /// (that remains the active tile's hydration source) and does not change the active provider.
+        /// </summary>
+        public async Task RefreshWidgetProviderAsync(ProviderId id)
+        {
+            lock (_widgetRefreshInFlight)
+            {
+                if (!_widgetRefreshInFlight.Add(id))
+                    return; // a refresh for this provider is already running; don't stack another.
+            }
+
+            try
+            {
+                var result = (await _service.FetchAsync(id).ConfigureAwait(false)).WithSource(SourceFor(id));
+                StateChanged?.Invoke(result);
+            }
+            catch (Exception ex)
+            {
+                Diagnostics.Log.Warning(ex, $"Widget provider refresh for {id} failed");
+            }
+            finally
+            {
+                lock (_widgetRefreshInFlight)
+                    _widgetRefreshInFlight.Remove(id);
+            }
         }
 
         /// <summary>Fetch all providers (cached) for the multi-provider view.</summary>
