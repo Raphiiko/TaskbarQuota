@@ -353,9 +353,6 @@ namespace TaskbarQuota.Controls
                 return rows;
             }
 
-            // Claude and Zai both pair base windows (Session/Weekly) with named extras (Claude's Fable,
-            // Zai's MCP). The generic "extras only" branch below would drop their base rows, so route them
-            // through base-rows-plus-extras like Codex.
             if (result.Id is ProviderId.Claude or ProviderId.Zai)
             {
                 var rows = BuildBaseRows(result, usage);

@@ -223,10 +223,8 @@ public class ZaiProviderTests
     }
 
     [Fact]
-    public void WidgetRows_ForZai_ShowSessionAndMcp_AndMcpTogglesWithRowExtra()
+    public void WidgetRows_ForZai_ToggleSessionAndMcpRows()
     {
-        // Regression: Zai always has an MCP extra window, which used to send it down the generic
-        // "extras only" widget branch and drop the Session/Weekly base rows entirely.
         WidgetSettingsService.ResetRowVisibilityForTesting();
         try
         {
@@ -235,11 +233,14 @@ public class ZaiProviderTests
             var result = UsageResult.Success(ProviderId.Zai, new ZaiProvider(), new ProviderFetchResult(usage, "api"));
 
             var defaultLabels = WidgetSummary.BuildRowLabelsForTesting(result, usage);
-            WidgetSettingsService.SetRowVisibleForTesting(ProviderId.Zai, WidgetSettingsService.RowExtra, false);
-            var mcpDisabled = WidgetSummary.BuildRowLabelsForTesting(result, usage);
-
             Assert.Equal(new[] { "Session", "MCP" }, defaultLabels);
-            Assert.Equal(new[] { "Session" }, mcpDisabled);
+
+            WidgetSettingsService.SetRowVisibleForTesting(ProviderId.Zai, WidgetSettingsService.RowExtra, false);
+            Assert.Equal(new[] { "Session" }, WidgetSummary.BuildRowLabelsForTesting(result, usage));
+
+            WidgetSettingsService.SetRowVisibleForTesting(ProviderId.Zai, WidgetSettingsService.RowExtra, true);
+            WidgetSettingsService.SetRowVisibleForTesting(ProviderId.Zai, WidgetSettingsService.RowPrimary, false);
+            Assert.Equal(new[] { "MCP" }, WidgetSummary.BuildRowLabelsForTesting(result, usage));
         }
         finally
         {
