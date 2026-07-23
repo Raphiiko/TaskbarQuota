@@ -1,5 +1,7 @@
 using System;
 using System.Text.Json;
+using TaskbarQuota;
+using TaskbarQuota.Controls;
 using TaskbarQuota.Usage;
 using TaskbarQuota.Usage.Providers;
 
@@ -218,6 +220,31 @@ public class ZaiProviderTests
         var ex = Assert.Throws<ProviderException>(() => ZaiProvider.BuildResult(doc.RootElement));
         Assert.Equal(ProviderErrorKind.Other, ex.Kind);
         Assert.Contains("no active coding plan", ex.Message);
+    }
+
+    [Fact]
+    public void WidgetRows_ForZai_ShowSessionAndMcp_AndMcpTogglesWithRowExtra()
+    {
+        // Regression: Zai always has an MCP extra window, which used to send it down the generic
+        // "extras only" widget branch and drop the Session/Weekly base rows entirely.
+        WidgetSettingsService.ResetRowVisibilityForTesting();
+        try
+        {
+            var usage = new UsageSnapshot(new RateWindow(10));
+            usage.ExtraRateWindows.Add(new NamedRateWindow("zai-mcp", "MCP", new RateWindow(0, label: "MCP")));
+            var result = UsageResult.Success(ProviderId.Zai, new ZaiProvider(), new ProviderFetchResult(usage, "api"));
+
+            var defaultLabels = WidgetSummary.BuildRowLabelsForTesting(result, usage);
+            WidgetSettingsService.SetRowVisibleForTesting(ProviderId.Zai, WidgetSettingsService.RowExtra, false);
+            var mcpDisabled = WidgetSummary.BuildRowLabelsForTesting(result, usage);
+
+            Assert.Equal(new[] { "Session", "MCP" }, defaultLabels);
+            Assert.Equal(new[] { "Session" }, mcpDisabled);
+        }
+        finally
+        {
+            WidgetSettingsService.ResetRowVisibilityForTesting();
+        }
     }
 
     [Fact]
