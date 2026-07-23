@@ -46,6 +46,10 @@ namespace TaskbarQuota.Controls
 
         public bool SuppressNextClick { get; set; }
 
+        /// <summary>Last width (logical px) this summary asked its host for; the taskbar host sums this
+        /// across all displayed summaries to size the multi-provider widget.</summary>
+        public int DesiredLogicalWidth { get; private set; }
+
         private readonly List<RenderedRow> _renderedRows = new();
         private List<WidgetUsageRow> _rows = new();
         private bool _forcePercentagesOnly;
@@ -792,7 +796,8 @@ namespace TaskbarQuota.Controls
 
             ApplyTaskbarForeground();
             SetBars();
-            DesiredHostWidthChanged?.Invoke(CalculateDesiredWidth());
+            DesiredLogicalWidth = CalculateDesiredWidth();
+            DesiredHostWidthChanged?.Invoke(DesiredLogicalWidth);
         }
 
         private void ClearDynamicContent()

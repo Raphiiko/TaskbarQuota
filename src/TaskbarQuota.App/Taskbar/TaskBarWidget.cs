@@ -5,6 +5,7 @@ using Microsoft.UI.Xaml.Input;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -16,6 +17,7 @@ using Windows.System;
 using TaskbarQuota.Controls;
 using TaskbarQuota.Diagnostics;
 using TaskbarQuota.Interop;
+using TaskbarQuota.Usage;
 
 namespace TaskbarQuota.Taskbar
 {
@@ -31,6 +33,9 @@ namespace TaskbarQuota.Taskbar
         private const string WidgetsButtonAutomationId = "WidgetsButton";
         private const int DefaultWidgetHostWidth = 172;
         private const int TrayClearanceLogicalPx = 6;
+        // Each tile's horizontal margin (logical px), 4 left + 4 right. Adjacent tiles therefore sit 8px
+        // apart and the host width must include this per tile, or multi-tile layouts clip.
+        private const int SummaryHorizontalMarginLogicalPx = 8;
         private static readonly TimeSpan PositionDisposeWait = TimeSpan.FromSeconds(3);
         // Approx width of the Win11 far-left Widgets/weather pill; used to reserve clearance when its exact
         // bounds can't be read via UIA, so the widget never anchors on top of it (issue #17).
@@ -63,7 +68,10 @@ namespace TaskbarQuota.Taskbar
 
         private IntPtr hwnd;
         private AppWindow? appWindow;
-        private WidgetSummary? widgetSummary;
+        // One tile per displayed provider, keyed by provider. Order in summaryPanel.Children is the
+        // on-taskbar order (non-pinned active first, then pinned providers).
+        private readonly Dictionary<ProviderId, WidgetSummary> _summaries = new();
+        private Microsoft.UI.Xaml.Controls.StackPanel? summaryPanel;
         private DesktopWindowXamlSource? host;
         private Microsoft.UI.Xaml.FrameworkElement? hostContent;
         private int WidgetHostWidth;
@@ -112,7 +120,8 @@ namespace TaskbarQuota.Taskbar
         }
         public IntPtr TaskbarHandle => hwndShell;
         public bool IsPrimaryTaskbar => isPrimaryTaskbar;
-        public WidgetSummary? Summary => widgetSummary;
+        /// <summary>Raised when any provider tile is clicked (provider-agnostic — opens the flyout).</summary>
+        public event Action? Clicked;
         public event EventHandler? Destroying;
 
         public TaskBarWidget(TaskbarWindowTarget target)
@@ -164,20 +173,17 @@ namespace TaskbarQuota.Taskbar
 
             host.Initialize(id);
             host.SiteBridge.ResizePolicy = Microsoft.UI.Content.ContentSizePolicy.ResizeContentToParentWindow;
-            widgetSummary = new WidgetSummary
+            summaryPanel = new Microsoft.UI.Xaml.Controls.StackPanel
             {
-                Margin = new Microsoft.UI.Xaml.Thickness(4, 0, 4, 0),
+                // Inter-tile gap comes from each tile's own 4px L/R margin (see CreateSummary), so no
+                // extra StackPanel.Spacing — that keeps the width math to just content + margins.
+                Orientation = Microsoft.UI.Xaml.Controls.Orientation.Horizontal,
                 HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Center,
                 VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Stretch,
             };
-            widgetSummary.DesiredHostWidthChanged += WidgetSummary_DesiredHostWidthChanged;
-            widgetSummary.PointerPressed += WidgetSummary_PointerPressed;
-            widgetSummary.PointerMoved += WidgetSummary_PointerMoved;
-            widgetSummary.PointerReleased += WidgetSummary_PointerReleased;
-            widgetSummary.PointerCanceled += WidgetSummary_PointerCanceled;
             hostContent = new Microsoft.UI.Xaml.Controls.Grid
             {
-                Children = { widgetSummary },
+                Children = { summaryPanel },
                 Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Colors.Transparent)
             };
             host.Content = hostContent;
@@ -251,9 +257,110 @@ namespace TaskbarQuota.Taskbar
         }
 
         private void WidgetSummary_DesiredHostWidthChanged(int logicalWidth)
+            => _ = RecomputeAggregateWidth();
+
+        /// <summary>
+        /// Reconciles the set of provider tiles to exactly <paramref name="providers"/> (in order):
+        /// removes dropped tiles, inserts new ones at their target index, and resizes the host to fit.
+        /// Existing tiles are never removed-and-re-added, so their state (and the settings subscription
+        /// they drop on Unload) survives.
+        /// </summary>
+        public void SetDisplayProviders(IReadOnlyList<ProviderId> providers)
         {
-            if (ResizeWidgetHost(logicalWidth))
+            if (summaryPanel is null)
+                return;
+
+            bool changed = false;
+            foreach (var id in new List<ProviderId>(_summaries.Keys))
+            {
+                if (providers.Contains(id))
+                    continue;
+                var summary = _summaries[id];
+                UnwireSummary(summary);
+                summaryPanel.Children.Remove(summary);
+                _summaries.Remove(id);
+                changed = true;
+            }
+
+            // Insert missing tiles at their target index. Surviving tiles keep their relative order, and
+            // the desired order is stable (non-pinned active first, then pinned in enum order), so an
+            // index insert yields the exact sequence without reordering existing children.
+            for (int i = 0; i < providers.Count; i++)
+            {
+                var id = providers[i];
+                if (_summaries.ContainsKey(id))
+                    continue;
+                var summary = CreateSummary();
+                _summaries[id] = summary;
+                int index = Math.Min(i, summaryPanel.Children.Count);
+                summaryPanel.Children.Insert(index, summary);
+                changed = true;
+            }
+
+            // Adding/removing a tile changes the total width, so RecomputeAggregateWidth usually
+            // repositions; only reposition explicitly when the set changed but the width happened not to.
+            bool repositioned = RecomputeAggregateWidth();
+            if (changed && !repositioned)
                 UpdatePosition();
+        }
+
+        /// <summary>Applies a fetch result to the tile that owns it (no-op if that provider isn't shown).</summary>
+        public void ApplyResult(UsageResult result, bool force = false)
+        {
+            if (!_summaries.TryGetValue(result.Id, out var summary))
+                return;
+            summary.Apply(result, force);
+            summary.SetActiveToolVisible(true);
+        }
+
+        private WidgetSummary CreateSummary()
+        {
+            var summary = new WidgetSummary
+            {
+                Margin = new Microsoft.UI.Xaml.Thickness(4, 0, 4, 0),
+                HorizontalAlignment = Microsoft.UI.Xaml.HorizontalAlignment.Center,
+                VerticalAlignment = Microsoft.UI.Xaml.VerticalAlignment.Stretch,
+            };
+            summary.DesiredHostWidthChanged += WidgetSummary_DesiredHostWidthChanged;
+            summary.PointerPressed += WidgetSummary_PointerPressed;
+            summary.PointerMoved += WidgetSummary_PointerMoved;
+            summary.PointerReleased += WidgetSummary_PointerReleased;
+            summary.PointerCanceled += WidgetSummary_PointerCanceled;
+            summary.Clicked += OnSummaryClicked;
+            return summary;
+        }
+
+        private void UnwireSummary(WidgetSummary summary)
+        {
+            summary.DesiredHostWidthChanged -= WidgetSummary_DesiredHostWidthChanged;
+            summary.PointerPressed -= WidgetSummary_PointerPressed;
+            summary.PointerMoved -= WidgetSummary_PointerMoved;
+            summary.PointerReleased -= WidgetSummary_PointerReleased;
+            summary.PointerCanceled -= WidgetSummary_PointerCanceled;
+            summary.Clicked -= OnSummaryClicked;
+        }
+
+        private void OnSummaryClicked() => Clicked?.Invoke();
+
+        // Sum every tile's desired logical width (+ inter-tile spacing) and resize the host. The
+        // logical->physical conversion stays inside ResizeWidgetHost, and its equality guard absorbs the
+        // repeated no-op calls that N tiles re-rendering in the same pass produce.
+        private bool RecomputeAggregateWidth()
+        {
+            if (_summaries.Count == 0)
+                return false;
+
+            int total = 0;
+            foreach (var summary in _summaries.Values)
+                total += summary.DesiredLogicalWidth;
+            // Each tile's content width excludes its own margin, so add it back per tile.
+            total += SummaryHorizontalMarginLogicalPx * _summaries.Count;
+
+            if (!ResizeWidgetHost(total))
+                return false;
+
+            UpdatePosition();
+            return true;
         }
 
         private bool ResizeWidgetHost(int logicalWidth)
@@ -434,12 +541,12 @@ namespace TaskbarQuota.Taskbar
                 if (disposedValue || targetAppWindow is null || !IsAlive)
                     return;
 
-                if (currentOffsetY != offsetY)
+                if (currentOffsetY != offsetY || currentOffsetX == int.MinValue)
                 {
                     targetAppWindow.MoveAndResize(new RectInt32(offsetX, offsetY, WidgetHostWidth, barRect.bottom - barRect.top));
                     currentOffsetX = offsetX; currentOffsetY = offsetY;
                 }
-                else if (Math.Abs(currentOffsetX - offsetX) >= RepositionDeadbandPx)
+                else if (Math.Abs((long)currentOffsetX - offsetX) >= RepositionDeadbandPx)
                 {
                     // Deadband: ignore sub-threshold recompute deltas (rounding / transient tray width changes)
                     // so the widget doesn't visibly twitch on routine taskbar events.
@@ -464,9 +571,10 @@ namespace TaskbarQuota.Taskbar
 
         public void StartDragging()
         {
-            if (isDragging || appWindow is null || hostContent is null || widgetSummary is null) return;
+            if (isDragging || appWindow is null || hostContent is null || _summaries.Count == 0) return;
             SetVisible(true);
-            widgetSummary.IsHitTestVisible = false;
+            foreach (var summary in _summaries.Values)
+                summary.IsHitTestVisible = false;
             User32.GetWindowRect(hwndShell, out var taskbarRect);
             User32.SetCursorPos(
                 taskbarRect.left + appWindow.Position.X + appWindow.Size.Width / 2,
@@ -481,14 +589,15 @@ namespace TaskbarQuota.Taskbar
 
         public void EndDragging(bool revert)
         {
-            if (!isDragging || appWindow is null || hostContent is null || widgetSummary is null) return;
+            if (!isDragging || appWindow is null || hostContent is null || _summaries.Count == 0) return;
             isDragging = false;
             hostContent.ReleasePointerCaptures();
             hostContent.KeyUp -= Content_KeyUp;
             hostContent.PointerMoved -= Content_PointerMoved;
             hostContent.PointerPressed -= Content_PointerPressed;
             hostContent.PointerReleased -= Content_PointerReleased;
-            widgetSummary.IsHitTestVisible = true;
+            foreach (var summary in _summaries.Values)
+                summary.IsHitTestVisible = true;
             if (revert)
             {
                 appWindow.Move(new PointInt32(currentOffsetX, currentOffsetY));
@@ -528,10 +637,10 @@ namespace TaskbarQuota.Taskbar
 
         private void WidgetSummary_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
-            if (appWindow is null || widgetSummary is null) return;
+            if (appWindow is null || sender is not WidgetSummary summary) return;
             isPointerTracking = true;
             isDirectDrag = false;
-            widgetSummary.CapturePointer(e.Pointer);
+            summary.CapturePointer(e.Pointer);
             User32.GetCursorPos(out var point);
             pressCursorPositionX = point.x;
             lastCursorPositionX = point.x;
@@ -541,31 +650,31 @@ namespace TaskbarQuota.Taskbar
 
         private void WidgetSummary_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
-            if (!isPointerTracking || appWindow is null || widgetSummary is null) return;
+            if (!isPointerTracking || appWindow is null || sender is not WidgetSummary summary) return;
             User32.GetCursorPos(out var point);
             if (!isDirectDrag)
             {
                 if (Math.Abs(point.x - pressCursorPositionX) < Math.Ceiling(4 * dpiScale))
                     return;
                 isDirectDrag = true;
-                widgetSummary.SuppressNextClick = true;
+                summary.SuppressNextClick = true;
                 e.Handled = true;
             }
 
             MoveWidgetWithCursor(point.x);
-            widgetSummary.SuppressNextClick = true;
+            summary.SuppressNextClick = true;
         }
 
         private void WidgetSummary_PointerReleased(object sender, PointerRoutedEventArgs e)
         {
-            if (widgetSummary is not null)
-                widgetSummary.ReleasePointerCaptures();
+            var summary = sender as WidgetSummary;
+            summary?.ReleasePointerCaptures();
             if (isDirectDrag && appWindow is not null)
             {
                 currentOffsetX = appWindow.Position.X;
                 SaveCustomPosition(currentOffsetX);
-                if (widgetSummary is not null)
-                    widgetSummary.SuppressNextClick = true;
+                if (summary is not null)
+                    summary.SuppressNextClick = true;
                 e.Handled = true;
             }
             isPointerTracking = false;
@@ -576,7 +685,7 @@ namespace TaskbarQuota.Taskbar
         {
             isPointerTracking = false;
             isDirectDrag = false;
-            widgetSummary?.ReleasePointerCaptures();
+            (sender as WidgetSummary)?.ReleasePointerCaptures();
         }
 
         private void MoveWidgetWithCursor(int cursorX)
@@ -1073,14 +1182,8 @@ namespace TaskbarQuota.Taskbar
             isVisible = false;
             positionUpdateCancellation.Cancel();
             try { appWindow?.Hide(); } catch { }
-            if (widgetSummary is not null)
-            {
-                widgetSummary.PointerPressed -= WidgetSummary_PointerPressed;
-                widgetSummary.DesiredHostWidthChanged -= WidgetSummary_DesiredHostWidthChanged;
-                widgetSummary.PointerMoved -= WidgetSummary_PointerMoved;
-                widgetSummary.PointerReleased -= WidgetSummary_PointerReleased;
-                widgetSummary.PointerCanceled -= WidgetSummary_PointerCanceled;
-            }
+            foreach (var summary in _summaries.Values)
+                UnwireSummary(summary);
             _ = CompleteDisposeAfterPositionUpdatesAsync();
             GC.SuppressFinalize(this);
         }
@@ -1151,7 +1254,8 @@ namespace TaskbarQuota.Taskbar
             appWindow = null;
             host = null;
             hostContent = null;
-            widgetSummary = null;
+            summaryPanel = null;
+            _summaries.Clear();
         }
     }
 }

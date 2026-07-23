@@ -1,9 +1,11 @@
+using System.Collections.Generic;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media;
 using TaskbarQuota.Helpers;
 using TaskbarQuota.Services;
+using TaskbarQuota.Usage;
 using TaskbarQuota.ViewModels;
 
 namespace TaskbarQuota.Views
@@ -12,6 +14,18 @@ namespace TaskbarQuota.Views
     {
         public SettingsViewModel ViewModel { get; } = new();
         private bool _isInitializing;
+        // Suppresses the Toggled handlers while we programmatically sync a row's toggles in place.
+        private bool _suppressProviderToggleEvents;
+        // The three ToggleSwitches per provider, so a toggle change updates only its own row (no
+        // whole-list rebuild, which flashed the UI).
+        private readonly Dictionary<ProviderId, ProviderToggleRow> _providerRows = new();
+
+        private sealed class ProviderToggleRow
+        {
+            public ToggleSwitch? Dashboard;
+            public ToggleSwitch? Widget;
+            public ToggleSwitch? Pinned;
+        }
 
         public SettingsPage()
         {
@@ -47,8 +61,12 @@ namespace TaskbarQuota.Views
         private void RebuildProviderSettings()
         {
             ProviderSettingsPanel.Children.Clear();
+            _providerRows.Clear();
             foreach (var item in ViewModel.Providers)
             {
+                var toggles = new ProviderToggleRow();
+                _providerRows[item.Id] = toggles;
+
                 var card = new CommunityToolkit.WinUI.Controls.SettingsCard
                 {
                     Margin = new Thickness(0, 0, 0, 4),
@@ -68,34 +86,77 @@ namespace TaskbarQuota.Views
                 });
                 card.Header = header;
 
-                var content = new StackPanel { Spacing = 8, MinWidth = 180 };
-                content.Children.Add(CreateProviderToggleRow("Dashboard", item, dashboard: true));
-                content.Children.Add(CreateProviderToggleRow("Widget", item, dashboard: false));
+                var content = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 20 };
+                content.Children.Add(CreateProviderToggleRow("Dashboard", item, ProviderToggleKind.Dashboard, toggles));
+                content.Children.Add(CreateProviderToggleRow("Widget", item, ProviderToggleKind.Widget, toggles));
+                content.Children.Add(CreateProviderToggleRow("Pinned", item, ProviderToggleKind.Pinned, toggles));
                 card.Content = content;
 
                 ProviderSettingsPanel.Children.Add(card);
             }
         }
 
-        private FrameworkElement CreateProviderToggleRow(string label, ProviderSettingItemViewModel item, bool dashboard)
+        private enum ProviderToggleKind { Dashboard, Widget, Pinned }
+
+        private FrameworkElement CreateProviderToggleRow(string label, ProviderSettingItemViewModel item, ProviderToggleKind kind, ProviderToggleRow toggles)
         {
-            var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
+            var row = new StackPanel { Orientation = Orientation.Vertical, Spacing = 2 };
             row.Children.Add(new TextBlock
             {
                 Text = label,
-                Width = 72,
-                VerticalAlignment = VerticalAlignment.Center,
                 Style = (Style)Application.Current.Resources["CaptionTextBlockStyle"],
             });
 
             var toggle = new ToggleSwitch
             {
-                IsOn = dashboard ? item.IsDashboardVisible : item.IsWidgetVisible,
+                IsOn = kind switch
+                {
+                    ProviderToggleKind.Dashboard => item.IsDashboardVisible,
+                    ProviderToggleKind.Pinned => item.IsPinned,
+                    _ => item.IsWidgetVisible,
+                },
+                // A provider can only be pinned to the taskbar when it's shown in the widget at all.
+                IsEnabled = kind != ProviderToggleKind.Pinned || item.IsWidgetVisible,
                 Tag = item,
             };
-            toggle.Toggled += dashboard ? OnProviderDashboardToggled : OnProviderWidgetToggled;
+            switch (kind)
+            {
+                case ProviderToggleKind.Dashboard: toggles.Dashboard = toggle; break;
+                case ProviderToggleKind.Pinned: toggles.Pinned = toggle; break;
+                default: toggles.Widget = toggle; break;
+            }
+            toggle.Toggled += kind switch
+            {
+                ProviderToggleKind.Dashboard => OnProviderDashboardToggled,
+                ProviderToggleKind.Pinned => OnProviderPinnedToggled,
+                _ => OnProviderWidgetToggled,
+            };
             row.Children.Add(toggle);
             return row;
+        }
+
+        // Sync one provider's three toggles to its current state in place (no list rebuild). Enable/Disable
+        // and pinning can flip sibling toggles, so this reflects that without flashing the whole list.
+        private void RefreshProviderRow(ProviderSettingItemViewModel item)
+        {
+            if (!_providerRows.TryGetValue(item.Id, out var row))
+                return;
+
+            _suppressProviderToggleEvents = true;
+            try
+            {
+                if (row.Dashboard is { } dashboard) dashboard.IsOn = item.IsDashboardVisible;
+                if (row.Widget is { } widget) widget.IsOn = item.IsWidgetVisible;
+                if (row.Pinned is { } pinned)
+                {
+                    pinned.IsOn = item.IsPinned;
+                    pinned.IsEnabled = item.IsWidgetVisible;
+                }
+            }
+            finally
+            {
+                _suppressProviderToggleEvents = false;
+            }
         }
 
         private void OnAutoHideUnavailableToggled(object sender, RoutedEventArgs e)
@@ -108,22 +169,37 @@ namespace TaskbarQuota.Views
 
         private void OnProviderDashboardToggled(object sender, RoutedEventArgs e)
         {
-            if (_isInitializing)
+            if (_isInitializing || _suppressProviderToggleEvents)
                 return;
             if (sender is not ToggleSwitch toggle || toggle.Tag is not ProviderSettingItemViewModel item)
                 return;
 
             ViewModel.ApplyDashboardVisibility(item, toggle.IsOn);
+            // Enable/Disable also flips widget visibility, so sync this row's toggles in place.
+            RefreshProviderRow(item);
         }
 
         private void OnProviderWidgetToggled(object sender, RoutedEventArgs e)
         {
-            if (_isInitializing)
+            if (_isInitializing || _suppressProviderToggleEvents)
                 return;
             if (sender is not ToggleSwitch toggle || toggle.Tag is not ProviderSettingItemViewModel item)
                 return;
 
             ViewModel.ApplyWidgetVisibility(item, toggle.IsOn);
+            // Widget visibility gates whether Pinned can be toggled, so sync this row's toggles in place.
+            RefreshProviderRow(item);
+        }
+
+        private void OnProviderPinnedToggled(object sender, RoutedEventArgs e)
+        {
+            if (_isInitializing || _suppressProviderToggleEvents)
+                return;
+            if (sender is not ToggleSwitch toggle || toggle.Tag is not ProviderSettingItemViewModel item)
+                return;
+
+            ViewModel.ApplyPinned(item, toggle.IsOn);
+            RefreshProviderRow(item);
         }
 
         private void OnThemeChanged(object sender, SelectionChangedEventArgs e)

@@ -48,6 +48,9 @@ public static class WidgetSettingsService
     private static readonly string WidgetProvidersPath =
         Path.Combine(AppStorage.AppDataDirectory, "widget-providers.json");
 
+    private static readonly string WidgetPinsPath =
+        Path.Combine(AppStorage.AppDataDirectory, "widget-pins.json");
+
     private static readonly string DashboardProvidersPath =
         Path.Combine(AppStorage.AppDataDirectory, "dashboard-providers.json");
 
@@ -57,6 +60,7 @@ public static class WidgetSettingsService
     private static readonly Dictionary<string, bool> RowVisibility = LoadRowVisibility();
     private static readonly Dictionary<string, bool> ProviderVisibility = LoadProviderVisibility();
     private static readonly Dictionary<string, bool> DashboardProviderVisibility = LoadDashboardProviderVisibility();
+    private static readonly Dictionary<string, bool> ProviderPins = LoadProviderPins();
 
     public static WidgetDisplayMode Current { get; private set; } = LoadWidgetDisplayMode();
     public static PercentageDisplayMode CurrentPercentageMode { get; private set; } = LoadPercentageDisplayMode();
@@ -125,6 +129,38 @@ public static class WidgetSettingsService
 
         SaveProviderVisibility();
         Changed?.Invoke(null, EventArgs.Empty);
+    }
+
+    public static bool IsProviderPinned(ProviderId provider)
+        => ProviderPins.TryGetValue(provider.ToString(), out bool pinned) && pinned;
+
+    /// <summary>
+    /// Pins a provider so the taskbar widget always shows it, regardless of the active app. Pinning
+    /// implies widget-visible (an "Ignored" provider makes no sense as a permanent tile), so turning a
+    /// pin on also turns the provider's widget visibility on.
+    /// </summary>
+    public static void SetProviderPinned(ProviderId provider, bool pinned)
+    {
+        bool pinChanged = SetProviderPinnedSilent(provider, pinned);
+        // Pinning implies widget-visible; unpinning leaves visibility alone.
+        bool visibilityChanged = pinned && SetProviderVisibleSilent(provider, true);
+        if (!pinChanged && !visibilityChanged)
+            return;
+
+        if (pinChanged)
+            SaveProviderPins();
+        if (visibilityChanged)
+            SaveProviderVisibility();
+        Changed?.Invoke(null, EventArgs.Empty);
+    }
+
+    private static bool SetProviderPinnedSilent(ProviderId provider, bool pinned)
+    {
+        if (IsProviderPinned(provider) == pinned)
+            return false;
+
+        ProviderPins[provider.ToString()] = pinned;
+        return true;
     }
 
     public static void SetProviderDashboardVisible(ProviderId provider, bool visible)
@@ -235,7 +271,7 @@ public static class WidgetSettingsService
         var parts = Enum.GetValues<ProviderId>()
             .OrderBy(provider => provider.ToString())
             .Select(provider =>
-                $"{provider}:{(IsProviderVisible(provider) ? 1 : 0)}:{(IsProviderDashboardVisible(provider) ? 1 : 0)}");
+                $"{provider}:{(IsProviderVisible(provider) ? 1 : 0)}:{(IsProviderDashboardVisible(provider) ? 1 : 0)}:{(IsProviderPinned(provider) ? 1 : 0)}");
         return string.Join(",", parts);
     }
 
@@ -253,6 +289,12 @@ public static class WidgetSettingsService
 
     internal static void SetProviderDashboardVisibleForTesting(ProviderId provider, bool visible)
         => DashboardProviderVisibility[provider.ToString()] = visible;
+
+    internal static void SetProviderPinnedForTesting(ProviderId provider, bool pinned)
+        => ProviderPins[provider.ToString()] = pinned;
+
+    internal static void ResetProviderPinsForTesting()
+        => ProviderPins.Clear();
 
     internal static void ResetDashboardProviderVisibilityForTesting()
         => DashboardProviderVisibility.Clear();
@@ -460,6 +502,35 @@ public static class WidgetSettingsService
         {
             Directory.CreateDirectory(Path.GetDirectoryName(WidgetProvidersPath)!);
             File.WriteAllText(WidgetProvidersPath, JsonSerializer.Serialize(ProviderVisibility, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch
+        {
+            // Best effort. The widget can still use the in-memory value for this run.
+        }
+    }
+
+    private static Dictionary<string, bool> LoadProviderPins()
+    {
+        try
+        {
+            if (!File.Exists(WidgetPinsPath))
+                return new Dictionary<string, bool>();
+
+            var loaded = JsonSerializer.Deserialize<Dictionary<string, bool>>(File.ReadAllText(WidgetPinsPath));
+            return loaded ?? new Dictionary<string, bool>();
+        }
+        catch
+        {
+            return new Dictionary<string, bool>();
+        }
+    }
+
+    private static void SaveProviderPins()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(WidgetPinsPath)!);
+            File.WriteAllText(WidgetPinsPath, JsonSerializer.Serialize(ProviderPins, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch
         {

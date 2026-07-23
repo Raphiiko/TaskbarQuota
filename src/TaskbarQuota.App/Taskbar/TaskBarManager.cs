@@ -95,7 +95,11 @@ namespace TaskbarQuota.Taskbar
                 return;
 
             _widgetHealthTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
-            _widgetHealthTimer.Tick += (_, _) => EnsureWidgets();
+            _widgetHealthTimer.Tick += (_, _) =>
+            {
+                EnsureWidgets();
+                RefreshPinnedTiles();
+            };
             _widgetHealthTimer.Start();
         }
 
@@ -154,8 +158,7 @@ namespace TaskbarQuota.Taskbar
                     if (sender is TaskBarWidget destroyedWidget)
                         _dispatcher?.TryEnqueue(DispatcherQueuePriority.High, () => OnWidgetDestroying(destroyedWidget));
                 };
-                if (widget.Summary is { } summary)
-                    summary.Clicked += () => _dispatcher?.TryEnqueue(() => ToggleFlyout(widget));
+                widget.Clicked += () => _dispatcher?.TryEnqueue(() => ToggleFlyout(widget));
                 Widgets[target.Handle] = widget;
                 SyncWidgetState(widget);
                 PrewarmFlyout();
@@ -189,42 +192,64 @@ namespace TaskbarQuota.Taskbar
 
         private static void SyncWidgetState(TaskBarWidget widget)
         {
-            if (!widget.IsAlive || widget.Summary is not { } summary)
+            if (!widget.IsAlive)
                 return;
 
             var coordinator = UsageCoordinator.Instance;
-            var target = coordinator.WidgetDisplayProvider;
-            bool shouldShowWidget = coordinator.IsActiveToolPresent && target is not null;
-            widget.SetVisible(shouldShowWidget);
+            var providers = coordinator.WidgetDisplayProviders;
 
-            // No enabled+available provider -> hide the native host instead of leaving a transparent
-            // taskbar child window over the notification area (#10).
-            if (target is not { } targetProvider)
-            {
-                summary.SetActiveToolVisible(false);
+            // No provider to show -> hide the native host instead of leaving a transparent taskbar child
+            // window over the notification area (#10).
+            widget.SetVisible(providers.Count > 0);
+            widget.SetDisplayProviders(providers);
+            if (providers.Count == 0)
                 return;
-            }
 
-            UsageResult? toApply = coordinator.LastState is { } last && last.Id == targetProvider
-                ? last
-                : coordinator.Service.TryGetCached(targetProvider, out var cached)
-                    ? cached
-                    : coordinator.Service.TryGetLastSuccessfulLiveResult(targetProvider, out var lastSuccess)
-                        ? lastSuccess
-                        : coordinator.Service.Get(targetProvider) is { } usageProvider
-                            ? UsageResult.Pending(targetProvider, usageProvider, "Loading...")
-                            : null;
-
-            if (toApply is { } result)
+            bool anyMissing = false;
+            foreach (var provider in providers)
             {
-                summary.Apply(result, force: true);
-                LogWidgetApply(result.Id, "sync");
+                var toApply = HydrateResult(coordinator, provider);
+                if (toApply is { } result)
+                {
+                    widget.ApplyResult(result, force: true);
+                    LogWidgetApply(result.Id, "sync");
+                }
+                else
+                {
+                    anyMissing = true;
+                }
             }
 
-            summary.SetActiveToolVisible(shouldShowWidget);
-
-            if (toApply is null)
+            if (anyMissing)
                 _ = coordinator.TickAsync(force: true);
+        }
+
+        // Best cached result to seed a tile with: the last active publish, then any cache tier, then a
+        // Pending placeholder. Returns null only when the provider is unknown to the service.
+        private static UsageResult? HydrateResult(UsageCoordinator coordinator, ProviderId provider)
+        {
+            if (coordinator.LastState is { } last && last.Id == provider)
+                return last;
+            if (coordinator.Service.TryGetCached(provider, out var cached))
+                return cached;
+            if (coordinator.Service.TryGetLastSuccessfulLiveResult(provider, out var lastSuccess))
+                return lastSuccess;
+            if (coordinator.Service.Get(provider) is { } usageProvider)
+                return UsageResult.Pending(provider, usageProvider, "Loading...");
+            return null;
+        }
+
+        // Keep pinned (non-active) tiles fresh. The active tile is already refreshed by the coordinator's
+        // 500 ms tick; pinned providers otherwise never re-fetch, so nudge them here. FetchAsync is
+        // cache-TTL gated, so this is a cheap cache hit on most ticks.
+        private static void RefreshPinnedTiles()
+        {
+            var coordinator = UsageCoordinator.Instance;
+            foreach (var provider in coordinator.WidgetDisplayProviders)
+            {
+                if (provider != coordinator.ActiveProvider)
+                    _ = coordinator.RefreshWidgetProviderAsync(provider);
+            }
         }
 
         private static void ToggleFlyout(TaskBarWidget widget)
@@ -264,21 +289,23 @@ namespace TaskbarQuota.Taskbar
 
         private static void ApplyStateChanged(UsageResult result)
         {
-            var active = UsageCoordinator.Instance.WidgetDisplayProvider;
-            if (active is null || result.Id != active)
-                return;
+            var providers = UsageCoordinator.Instance.WidgetDisplayProviders;
+            bool inDisplay = providers.Contains(result.Id);
 
             foreach (var widget in Widgets.Values.ToArray())
             {
-                if (!widget.IsAlive || widget.Summary is not { } summary)
+                if (!widget.IsAlive)
                     continue;
 
-                summary.Apply(result);
-                LogWidgetApply(result.Id, "state");
-                bool isVisible = UsageCoordinator.Instance.IsActiveToolPresent
-                    && UsageCoordinator.Instance.WidgetDisplayProvider is not null;
-                widget.SetVisible(isVisible);
-                summary.SetActiveToolVisible(isVisible);
+                // Reconcile first so a newly-active provider gets its tile before we route the result;
+                // SetDisplayProviders is a cheap no-op when the set is unchanged.
+                widget.SetVisible(providers.Count > 0);
+                widget.SetDisplayProviders(providers);
+                if (inDisplay)
+                {
+                    widget.ApplyResult(result);
+                    LogWidgetApply(result.Id, "state");
+                }
             }
         }
 
@@ -300,14 +327,12 @@ namespace TaskbarQuota.Taskbar
 
         private static void ApplyActiveToolPresenceChanged(bool isPresent)
         {
-            bool isVisible = isPresent && UsageCoordinator.Instance.WidgetDisplayProvider is not null;
+            // Pinned tiles stay on the taskbar even when no AI tool is foreground; only the non-pinned
+            // active tile follows presence. SyncWidgetState recomputes the whole set and hydrates it.
             foreach (var widget in Widgets.Values.ToArray())
             {
-                if (!widget.IsAlive || widget.Summary is not { } summary)
-                    continue;
-
-                widget.SetVisible(isVisible);
-                summary.SetActiveToolVisible(isVisible);
+                if (widget.IsAlive)
+                    SyncWidgetState(widget);
             }
         }
 
